@@ -111,6 +111,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        refreshThumb();
         if (hasPerm(Manifest.permission.CAMERA)) {
             startCamThread();
             if (texture.isAvailable()) openCamera(); else texture.setSurfaceTextureListener(surfaceListener);
@@ -202,6 +203,7 @@ public class MainActivity extends Activity {
         thumb.setBackground(tb);
         thumb.setClipToOutline(true);
         bottom.addView(thumb, new LinearLayout.LayoutParams(dp(52), dp(52)));
+        thumb.setOnClickListener(v -> new Gallery(this, rootView, this::refreshThumb).show());
         bottom.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
 
         View shutter = new View(this);
@@ -653,6 +655,15 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 左下角显示最近一张照片。 */
+    private void refreshThumb() {
+        new Thread(() -> {
+            List<Uri> l = Gallery.query(this, null);
+            Bitmap b = l.isEmpty() ? null : Gallery.thumb(this, l.get(0), dp(104));
+            ui.post(() -> thumb.setImageBitmap(b));
+        }).start();
+    }
+
     /** 编辑完成后保存。 */
     private void saveEdited(Bitmap bmp, WatermarkData d) {
         toast("正在保存…");
@@ -676,6 +687,7 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (PhotoEditor.handleBack(rootView)) return;
+        if (Gallery.handleBack(rootView)) return;
         super.onBackPressed();
     }
 
