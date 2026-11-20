@@ -39,6 +39,7 @@ import android.text.InputType;
 import android.util.Size;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.OrientationEventListener;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
@@ -81,6 +82,12 @@ public class MainActivity extends Activity {
     private Handler camHandler;
     private Size previewSize, jpegSize;
     private int sensorOrientation = 90;
+    /** 手机当前转了多少度（0/90/180/270，顺时针），用来出横屏照片和转动取景水印。 */
+    private int devRot = 0;
+    private int captureRot = 0;
+    private OrientationEventListener orient;
+    /** 成片长边像素，和马克水印相机一致：竖拍 1536×2048，横拍 2048×1536。 */
+    private static final int OUT_LONG = 2048;
     private boolean busy = false;
     private boolean askedPerms = false;
 
@@ -106,12 +113,23 @@ public class MainActivity extends Activity {
         loadSettings();
         setContentView(buildUi());
         ui.postDelayed(tick, 1000);
+        orient = new OrientationEventListener(this) {
+            @Override public void onOrientationChanged(int o) {
+                if (o == ORIENTATION_UNKNOWN) return;
+                int r = ((o + 45) / 90 * 90) % 360;
+                // 加一点回差，避免在 45° 附近来回跳
+                int diff = Math.abs(o - devRot);
+                if (diff > 180) diff = 360 - diff;
+                if (r != devRot && diff > 55) { devRot = r; drawOverlay(); }
+            }
+        };
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         refreshThumb();
+        if (orient != null && orient.canDetectOrientation()) orient.enable();
         if (hasPerm(Manifest.permission.CAMERA)) {
             startCamThread();
             if (texture.isAvailable()) openCamera(); else texture.setSurfaceTextureListener(surfaceListener);
@@ -127,6 +145,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        if (orient != null) orient.disable();
         closeCamera();
         stopCamThread();
         super.onPause();
@@ -274,8 +293,19 @@ public class MainActivity extends Activity {
     private void drawOverlay() {
         int w = frame.getWidth(), h = frame.getHeight();
         if (w <= 0 || h <= 0) return;
-        Bitmap bm = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        Watermark.draw(new Canvas(bm), w, h, buildData(System.currentTimeMillis(), null));
+        int r = devRot;
+        boolean land = r % 180 != 0;
+        int bw = land ? h : w, bh = land ? w : h;
+        Bitmap bm = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
+        Watermark.draw(new Canvas(bm), bw, bh, buildData(System.currentTimeMillis(), null));
+        if (r != 0) {
+            // 手机顺时针转了 r 度，水印要逆时针转 r 度才能对拍照的人是正的
+            Matrix m = new Matrix();
+            m.postRotate(-r);
+            Bitmap rb = Bitmap.createBitmap(bm, 0, 0, bw, bh, m, true);
+            bm.recycle();
+            bm = rb;
+        }
         overlay.setImageBitmap(bm);
     }
 
@@ -597,7 +627,8 @@ public class MainActivity extends Activity {
             CaptureRequest.Builder rb = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             rb.addTarget(reader.getSurface());
             rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            rb.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation);
+            captureRot = devRot;
+            rb.set(CaptureRequest.JPEG_ORIENTATION, (sensorOrientation + captureRot) % 360);
             rb.set(CaptureRequest.JPEG_QUALITY, (byte) 95);
             session.capture(rb.build(), null, camHandler);
             frame.animate().alpha(0.3f).setDuration(80).withEndAction(() -> frame.animate().alpha(1f).setDuration(120));
@@ -636,14 +667,25 @@ public class MainActivity extends Activity {
                 else if (or == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
                 else if (or == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
             } catch (Exception ignored) { }
-            // 竖屏拍摄但设备没写 EXIF 也没旋转像素时，按传感器方向补转
-            if (deg == 0 && bmp.getWidth() > bmp.getHeight()) deg = sensorOrientation;
+            // 设备既没写 EXIF 也没转像素时，按「传感器方向 + 手机转角」自己转
+            int total = (sensorOrientation + captureRot) % 360;
+            boolean wantLand = (total % 180 == 0); // 传感器原图是横的
+            if (deg == 0 && (bmp.getWidth() > bmp.getHeight()) != wantLand) deg = total;
             if (deg != 0) {
                 Matrix m = new Matrix();
                 m.postRotate(deg);
                 Bitmap rot = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
                 if (rot != bmp) bmp.recycle();
                 bmp = rot;
+            }
+            // 统一成马克的成片尺寸：长边 2048，4:3
+            int lo = Math.max(bmp.getWidth(), bmp.getHeight());
+            if (lo > OUT_LONG) {
+                int nw = Math.round(bmp.getWidth() * (float) OUT_LONG / lo);
+                int nh = Math.round(bmp.getHeight() * (float) OUT_LONG / lo);
+                Bitmap sc = Bitmap.createScaledBitmap(bmp, nw, nh, true);
+                if (sc != bmp) bmp.recycle();
+                bmp = sc;
             }
             if (!bmp.isMutable()) bmp = bmp.copy(Bitmap.Config.ARGB_8888, true);
             Watermark.draw(new Canvas(bmp), bmp.getWidth(), bmp.getHeight(), d);
@@ -700,7 +742,7 @@ public class MainActivity extends Activity {
         Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
         if (uri == null) return null;
         try (OutputStream os = getContentResolver().openOutputStream(uri)) {
-            bmp.compress(Bitmap.CompressFormat.JPEG, 95, os);
+            bmp.compress(Bitmap.CompressFormat.JPEG, 92, os);
         } catch (Exception e) {
             getContentResolver().delete(uri, null, null);
             return null;
