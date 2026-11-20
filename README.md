@@ -20,7 +20,7 @@
 
 ## 安装
 
-直接下载 [release/shengli-watermark.apk](release/shengli-watermark.apk)，在手机上安装（需允许「安装未知来源应用」）。
+直接下载 [release/watermark-camera.apk](release/watermark-camera.apk)，在手机上安装（需允许「安装未知来源应用」）。
 
 要求 Android 10 及以上。
 
