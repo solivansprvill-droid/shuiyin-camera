@@ -3,6 +3,7 @@ package com.shengli.watermark;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.text.Layout;
@@ -15,10 +16,13 @@ import java.util.Calendar;
 import java.util.List;
 import java.util.Locale;
 
-/** 胜利水印相机的水印绘制：左下角信息块 + 右下角品牌小字。 */
+/**
+ * 打卡水印：左下角方块时间、日期星期、黄线、地点、经纬度、自定义文字、校验状态；
+ * 右下角品牌和防伪码。
+ */
 public final class Watermark {
-    private static final int RED = Color.rgb(220, 38, 38);
-    private static final int YELLOW = Color.rgb(250, 204, 21);
+    private static final int BOX = Color.argb(215, 84, 99, 128);
+    private static final int YELLOW = Color.rgb(255, 193, 7);
     private static final String[] WEEK = {"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"};
 
     private Watermark() { }
@@ -29,123 +33,197 @@ public final class Watermark {
         return WEEK[c.get(Calendar.DAY_OF_WEEK) - 1];
     }
 
-    public static List<String> infoLines(WatermarkData d) {
-        List<String> lines = new ArrayList<>();
-        if (d.showAddress && d.address != null && !d.address.isEmpty()) lines.add("地点：" + d.address);
-        if (d.showCoords && !Double.isNaN(d.lat)) {
-            lines.add(String.format(Locale.US, "经纬度：%.6f°%s, %.6f°%s",
-                    Math.abs(d.lat), d.lat >= 0 ? "N" : "S", Math.abs(d.lng), d.lng >= 0 ? "E" : "W"));
-        }
-        if (d.person != null && !d.person.isEmpty()) lines.add("打卡人：" + d.person);
-        if (d.note != null && !d.note.isEmpty()) lines.add("备注：" + d.note);
-        return lines;
+    public static String coords(double lat, double lng) {
+        return String.format(Locale.US, "%.6f°%s  %.6f°%s",
+                Math.abs(lng), lng >= 0 ? "E" : "W", Math.abs(lat), lat >= 0 ? "N" : "S");
     }
 
-    /** 在宽 w、高 h 的画布上绘制水印。 */
-    public static void draw(Canvas canvas, int w, int h, WatermarkData d) {
-        float u = Math.min(w, h) / 1080f;          // 以 1080 宽为基准缩放
-        float margin = 40 * u;
-        float pad = 28 * u;
-        float boxW = Math.min(w - margin * 2, 820 * u);
-        float textW = boxW - pad * 2;
+    public static void draw(Canvas c, int w, int h, WatermarkData d) {
+        float u = Math.min(w, h) / 1080f;
+        float x0 = 24 * u;
+        float colW = Math.min(w * 0.62f, 520 * u);
 
-        String time = new SimpleDateFormat("HH:mm", Locale.CHINA).format(d.timeMillis);
-        String date = new SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(d.timeMillis)
-                + "  " + weekday(d.timeMillis);
+        Typeface bold = Typeface.create("sans-serif-condensed", Typeface.BOLD);
+        TextPaint digitP = tp(64 * u, Color.WHITE, bold);
+        TextPaint colonP = tp(60 * u, Color.WHITE, bold);
+        TextPaint dateP = tp(56 * u, Color.WHITE, Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        TextPaint addrP = tp(42 * u, Color.WHITE, Typeface.DEFAULT);
+        TextPaint smallP = tp(36 * u, Color.WHITE, Typeface.DEFAULT);
+        TextPaint statusP = tp(36 * u, Color.argb(235, 255, 255, 255), Typeface.DEFAULT);
 
-        TextPaint timeP = paint(110 * u, Color.WHITE, true);
-        TextPaint dateP = paint(40 * u, Color.WHITE, true);
-        TextPaint titleP = paint(38 * u, Color.WHITE, true);
-        TextPaint infoP = paint(34 * u, Color.WHITE, false);
+        float iconW = 54 * u;
+        float textW = colW - iconW;
 
-        String title = (d.title == null || d.title.isEmpty()) ? "工作打卡" : d.title;
-        float titleW = titleP.measureText(title) + 36 * u;
-        float titleH = 64 * u;
-
-        List<StaticLayout> infos = new ArrayList<>();
-        float infoH = 0;
-        for (String line : infoLines(d)) {
-            StaticLayout sl = StaticLayout.Builder.obtain(line, 0, line.length(), infoP, (int) textW)
-                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                    .setLineSpacing(4 * u, 1f)
-                    .setMaxLines(3)
-                    .build();
-            infos.add(sl);
-            infoH += sl.getHeight() + 10 * u;
+        List<Object[]> blocks = new ArrayList<>(); // {layout, iconType}
+        if (d.showAddress && d.address != null && !d.address.isEmpty()) {
+            blocks.add(new Object[]{layout(d.address, addrP, textW, 3, u), "pin"});
         }
+        if (d.showCoords && !Double.isNaN(d.lat)) {
+            blocks.add(new Object[]{layout("经纬度 " + coords(d.lat, d.lng), smallP, textW, 2, u), ""});
+        }
+        for (String s : d.lines) {
+            if (s != null && !s.trim().isEmpty()) blocks.add(new Object[]{layout(s.trim(), addrP, textW, 2, u), ""});
+        }
+        String status = d.verified ? "胜利水印相机·时间地点未修改" : d.statusNote;
+        StaticLayout statusL = (status == null || status.isEmpty()) ? null : layout(status, statusP, textW, 1, u);
 
-        Paint.FontMetrics tm = timeP.getFontMetrics();
-        float timeH = tm.descent - tm.ascent;
-        float headerH = Math.max(timeH, titleH);
-        float dividerGap = 22 * u;
-        float boxH = pad + headerH + 8 * u + 48 * u + (infos.isEmpty() ? 0 : dividerGap + infoH) + pad - 10 * u;
+        float boxH = 100 * u, boxW = 84 * u, colonW = 38 * u;
+        Paint.FontMetrics dm = dateP.getFontMetrics();
+        float dateH = dm.descent - dm.ascent;
+        float total = boxH + 14 * u + dateH + 10 * u + 6 * u + 14 * u;
+        for (Object[] b : blocks) total += ((StaticLayout) b[0]).getHeight() + 8 * u;
+        if (statusL != null) total += statusL.getHeight() + 6 * u;
 
-        float left = margin;
-        float bottom = h - margin - 36 * u;
-        float top = bottom - boxH;
+        float y = h - 22 * u - total;
 
-        Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
-        bg.setColor(Color.argb(120, 0, 0, 0));
-        canvas.drawRoundRect(new RectF(left, top, left + boxW, bottom), 22 * u, 22 * u, bg);
-
-        // 左侧黄色竖条
-        Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG);
-        bar.setColor(YELLOW);
-        canvas.drawRoundRect(new RectF(left, top, left + 10 * u, bottom), 5 * u, 5 * u, bar);
-
-        // 大号时间
-        float x = left + pad;
-        float y = top + pad - tm.ascent;
-        canvas.drawText(time, x, y, timeP);
-
-        // 红色标题胶囊
-        float chipX = x + timeP.measureText(time) + 26 * u;
-        float chipTop = top + pad + (timeH - titleH) / 2f;
-        Paint chip = new Paint(Paint.ANTI_ALIAS_FLAG);
-        chip.setColor(RED);
-        if (chipX + titleW > left + boxW - pad) titleW = left + boxW - pad - chipX;
-        canvas.drawRoundRect(new RectF(chipX, chipTop, chipX + titleW, chipTop + titleH), 12 * u, 12 * u, chip);
-        Paint.FontMetrics fm = titleP.getFontMetrics();
-        float ty = chipTop + titleH / 2f - (fm.ascent + fm.descent) / 2f;
-        canvas.save();
-        canvas.clipRect(chipX, chipTop, chipX + titleW, chipTop + titleH);
-        canvas.drawText(title, chipX + 18 * u, ty, titleP);
-        canvas.restore();
-
-        // 日期星期
-        float dateY = top + pad + headerH + 8 * u - dateP.getFontMetrics().ascent;
-        dateP.setColor(YELLOW);
-        canvas.drawText(date, x, dateY, dateP);
-
-        float cy = top + pad + headerH + 8 * u + 48 * u;
-        if (!infos.isEmpty()) {
-            Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
-            line.setColor(Color.argb(110, 255, 255, 255));
-            line.setStrokeWidth(Math.max(1, 2 * u));
-            cy += dividerGap / 2f;
-            canvas.drawLine(x, cy, left + boxW - pad, cy, line);
-            cy += dividerGap / 2f;
-            for (StaticLayout sl : infos) {
-                canvas.save();
-                canvas.translate(x, cy);
-                sl.draw(canvas);
-                canvas.restore();
-                cy += sl.getHeight() + 10 * u;
+        // 方块时间
+        String hms = new SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(d.timeMillis);
+        String[] parts = hms.split(":");
+        Paint boxPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        boxPaint.setColor(BOX);
+        float x = x0;
+        Paint.FontMetrics fm = digitP.getFontMetrics();
+        for (int i = 0; i < 3; i++) {
+            c.drawRoundRect(new RectF(x, y, x + boxW, y + boxH), 10 * u, 10 * u, boxPaint);
+            float tw = digitP.measureText(parts[i]);
+            c.drawText(parts[i], x + (boxW - tw) / 2f, y + boxH / 2f - (fm.ascent + fm.descent) / 2f, digitP);
+            x += boxW;
+            if (i < 2) {
+                float cw = colonP.measureText(":");
+                c.drawText(":", x + (colonW - cw) / 2f, y + boxH / 2f - (fm.ascent + fm.descent) / 2f - 4 * u, colonP);
+                x += colonW;
             }
         }
+        y += boxH + 14 * u;
 
-        // 右下角品牌
-        TextPaint brand = paint(26 * u, Color.argb(200, 255, 255, 255), false);
-        String b = "胜利水印相机";
-        canvas.drawText(b, w - margin - brand.measureText(b), h - margin, brand);
+        // 日期 星期
+        String date = new SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(d.timeMillis) + "  " + weekday(d.timeMillis);
+        c.drawText(date, x0, y - dm.ascent, dateP);
+        y += dateH + 10 * u;
+
+        // 黄线
+        Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        line.setColor(YELLOW);
+        c.drawRect(x0, y, x0 + colW, y + 6 * u, line);
+        y += 6 * u + 14 * u;
+
+        // 地点、经纬度、文字
+        for (Object[] b : blocks) {
+            StaticLayout sl = (StaticLayout) b[0];
+            if ("pin".equals(b[1])) drawPin(c, x0 + 10 * u, y + 6 * u, 30 * u);
+            c.save();
+            c.translate(x0 + iconW, y);
+            sl.draw(c);
+            c.restore();
+            y += sl.getHeight() + 8 * u;
+        }
+        if (statusL != null) {
+            drawShield(c, x0 + 6 * u, y + 4 * u, 34 * u, d.verified);
+            c.save();
+            c.translate(x0 + iconW, y);
+            statusL.draw(c);
+            c.restore();
+        }
+
+        drawBrand(c, w, h, u, d);
     }
 
-    private static TextPaint paint(float size, int color, boolean bold) {
+    private static void drawBrand(Canvas c, int w, int h, float u, WatermarkData d) {
+        float right = w - 20 * u;
+        float y = h - 14 * u;
+        Typeface b = Typeface.create(Typeface.DEFAULT, Typeface.BOLD);
+        if (d.verified && d.code != null && !d.code.isEmpty()) {
+            TextPaint codeP = tp(30 * u, Color.WHITE, Typeface.create("sans-serif-condensed", Typeface.BOLD));
+            String s = "防伪 " + d.code;
+            c.drawText(s, right - codeP.measureText(s), y, codeP);
+            y -= 30 * u + 14 * u;
+        }
+        // 白色小标签
+        TextPaint badgeP = tp(28 * u, Color.rgb(40, 40, 40), b);
+        badgeP.clearShadowLayer();
+        String badge = "真实时间";
+        float bw = badgeP.measureText(badge) + 24 * u, bh = 44 * u;
+        Paint white = new Paint(Paint.ANTI_ALIAS_FLAG);
+        white.setColor(Color.WHITE);
+        RectF r = new RectF(right - bw, y - bh, right, y);
+        c.drawRoundRect(r, 6 * u, 6 * u, white);
+        Paint.FontMetrics fm = badgeP.getFontMetrics();
+        c.drawText(badge, r.left + 12 * u, r.centerY() - (fm.ascent + fm.descent) / 2f, badgeP);
+        y -= bh + 10 * u;
+
+        TextPaint l2 = tp(44 * u, Color.WHITE, b);
+        String s2 = "水印相机";
+        c.drawText(s2, right - l2.measureText(s2), y, l2);
+        y -= 44 * u + 8 * u;
+        TextPaint l1 = tp(40 * u, Color.WHITE, b);
+        String s1 = "· 胜利 ·";
+        float w2 = l2.measureText(s2);
+        c.drawText(s1, right - w2 / 2f - l1.measureText(s1) / 2f, y, l1);
+    }
+
+    private static void drawPin(Canvas c, float x, float y, float s) {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(Color.WHITE);
+        p.setShadowLayer(s / 10f, 0, s / 20f, Color.argb(140, 0, 0, 0));
+        float r = s / 2f;
+        Path path = new Path();
+        path.addCircle(x + r, y + r, r, Path.Direction.CW);
+        Path tip = new Path();
+        tip.moveTo(x + r * 0.15f, y + r * 1.45f);
+        tip.lineTo(x + r, y + s * 1.35f);
+        tip.lineTo(x + r * 1.85f, y + r * 1.45f);
+        tip.close();
+        path.op(tip, Path.Op.UNION);
+        Path hole = new Path();
+        hole.addCircle(x + r, y + r, r * 0.42f, Path.Direction.CW);
+        path.op(hole, Path.Op.DIFFERENCE);
+        c.drawPath(path, p);
+    }
+
+    private static void drawShield(Canvas c, float x, float y, float s, boolean ok) {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(s / 11f);
+        p.setColor(ok ? Color.WHITE : Color.rgb(255, 193, 7));
+        p.setStrokeJoin(Paint.Join.ROUND);
+        Path sh = new Path();
+        sh.moveTo(x + s / 2f, y);
+        sh.lineTo(x + s, y + s * 0.18f);
+        sh.lineTo(x + s, y + s * 0.5f);
+        sh.quadTo(x + s, y + s * 0.88f, x + s / 2f, y + s * 1.05f);
+        sh.quadTo(x, y + s * 0.88f, x, y + s * 0.5f);
+        sh.lineTo(x, y + s * 0.18f);
+        sh.close();
+        c.drawPath(sh, p);
+        Path mark = new Path();
+        if (ok) {
+            mark.moveTo(x + s * 0.28f, y + s * 0.52f);
+            mark.lineTo(x + s * 0.45f, y + s * 0.68f);
+            mark.lineTo(x + s * 0.74f, y + s * 0.36f);
+        } else {
+            mark.moveTo(x + s / 2f, y + s * 0.28f);
+            mark.lineTo(x + s / 2f, y + s * 0.6f);
+            mark.moveTo(x + s / 2f, y + s * 0.74f);
+            mark.lineTo(x + s / 2f, y + s * 0.78f);
+        }
+        c.drawPath(mark, p);
+    }
+
+    private static StaticLayout layout(String s, TextPaint p, float width, int maxLines, float u) {
+        return StaticLayout.Builder.obtain(s, 0, s.length(), p, (int) Math.max(10, width))
+                .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                .setLineSpacing(2 * u, 1f)
+                .setMaxLines(maxLines)
+                .setEllipsize(android.text.TextUtils.TruncateAt.END)
+                .build();
+    }
+
+    private static TextPaint tp(float size, int color, Typeface tf) {
         TextPaint p = new TextPaint(Paint.ANTI_ALIAS_FLAG);
         p.setTextSize(size);
         p.setColor(color);
-        p.setTypeface(bold ? Typeface.create(Typeface.DEFAULT, Typeface.BOLD) : Typeface.DEFAULT);
-        p.setShadowLayer(Math.max(1f, size / 14f), 0, size / 24f, Color.argb(160, 0, 0, 0));
+        p.setTypeface(tf);
+        p.setShadowLayer(Math.max(1f, size / 12f), 0, size / 28f, Color.argb(170, 0, 0, 0));
         return p;
     }
 }
