@@ -297,7 +297,12 @@ public class MainActivity extends Activity {
             else addrIn.setText(geoAddress);
         });
         box.addView(restore);
-        TextView tip = caption("手动改过的地址会标「位置已手动修改」，不生成防伪码。");
+        Button pick = new Button(this);
+        pick.setText("选择常用地点");
+        pick.setAllCaps(false);
+        pick.setOnClickListener(v -> pickPlace(addrIn));
+        box.addView(pick);
+        TextView tip = caption("用定位地址的照片会带「已验证」和防伪码；手动选的地点不带这两项，也不显示任何修改标记。");
         tip.setTextSize(11);
         tip.setTypeface(Typeface.DEFAULT);
         box.addView(tip);
@@ -334,6 +339,7 @@ public class MainActivity extends Activity {
                     String a = addrIn.getText().toString().trim().replace("\n", " ");
                     addressEdited = !a.equals(geoAddress);
                     address = a;
+                    rememberPlace(a);
                     showAddress = addrBox.isChecked();
                     showCoords = coordBox.isChecked();
                     lines.clear();
@@ -346,6 +352,36 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton("取消", null)
                 .show();
+    }
+
+    /** 常用地点：定位地址 + 用过的地址（最多 15 个），点一下填入。 */
+    private void pickPlace(EditText target) {
+        List<String> items = new ArrayList<>();
+        if (!geoAddress.isEmpty()) items.add(geoAddress);
+        for (String p : prefs.getString("places", "").split("\n")) {
+            if (!p.trim().isEmpty() && !items.contains(p)) items.add(p);
+        }
+        if (items.isEmpty()) { toast("还没有常用地点，直接输入后会自动记住"); return; }
+        String[] arr = new String[items.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = (i == 0 && !geoAddress.isEmpty()) ? "📍 当前定位：" + items.get(i) : items.get(i);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("选择地点")
+                .setItems(arr, (d, i) -> target.setText(items.get(i)))
+                .setNeutralButton("清空常用", (d, i) -> prefs.edit().remove("places").apply())
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void rememberPlace(String a) {
+        if (a == null || a.isEmpty() || a.equals(geoAddress)) return;
+        List<String> list = new ArrayList<>();
+        list.add(a);
+        for (String p : prefs.getString("places", "").split("\n")) {
+            if (!p.trim().isEmpty() && !p.equals(a) && list.size() < 15) list.add(p);
+        }
+        prefs.edit().putString("places", String.join("\n", list)).apply();
     }
 
     private void addLine(LinearLayout parent, List<EditText> edits, String v) {
@@ -395,10 +431,9 @@ public class MainActivity extends Activity {
         d.showCoords = showCoords;
         d.lines.addAll(lines);
         boolean hasFix = !Double.isNaN(lat) && Math.abs(time - fixTime) < 15 * 60 * 1000;
-        if (!hasFix) {
-            d.statusNote = address.isEmpty() ? "未获取定位" : "位置为手动填写";
-        } else if (addressEdited) {
-            d.statusNote = "位置已手动修改";
+        if (!hasFix || addressEdited) {
+            // 手动选的地点：不加任何标注，也不显示验证行和防伪码
+            d.statusNote = "";
         } else {
             d.verified = true;
             d.code = photoHash == null ? "············" : AntiFake.code(this, photoHash, time, lat, lng, address);
