@@ -14,7 +14,7 @@
 
 ## 安装
 
-到 [Releases](../../releases) 下载 `shengli-watermark.apk`，在手机上安装（需允许「安装未知来源应用」）。
+直接下载 [release/shengli-watermark.apk](release/shengli-watermark.apk)，在手机上安装（需允许「安装未知来源应用」）。
 
 要求 Android 10 及以上。
 
