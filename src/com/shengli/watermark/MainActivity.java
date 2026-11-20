@@ -5,240 +5,251 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Context;
-import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ImageFormat;
 import android.graphics.Matrix;
+import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
 import android.location.Location;
 import android.location.LocationManager;
 import android.media.ExifInterface;
+import android.media.Image;
+import android.media.ImageReader;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.provider.MediaStore;
-import android.text.Editable;
 import android.text.InputType;
-import android.text.TextWatcher;
+import android.util.Size;
 import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.File;
-import java.io.FileInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
-/** 胜利水印相机：拍照 → 预览编辑水印 → 保存到相册。无广告，无会员。 */
+/** 水印相机：取景画面上实时显示水印，点水印或「编辑」直接改文字，按快门即保存。无广告，无会员。 */
 public class MainActivity extends Activity {
-    private static final int REQ_CAMERA = 1001;
-    private static final int REQ_LOC = 1002;
+    private static final int REQ_PERMS = 1001;
     private static final int MAX_TEXTS = 5;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
+    private SharedPreferences prefs;
+
+    // 相机
+    private TextureView texture;
+    private ImageView overlay;
+    private FrameLayout frame;
+    private CameraDevice camera;
+    private CameraCaptureSession session;
+    private ImageReader reader;
+    private HandlerThread camThread;
+    private Handler camHandler;
+    private Size previewSize, jpegSize;
+    private int sensorOrientation = 90;
+    private boolean busy = false;
+    private boolean askedPerms = false;
 
     // 定位
     private double lat = Double.NaN, lng = Double.NaN;
     private long fixTime = 0;
-    private String geoAddress = "";      // 系统反查得到的真实地址
-    private boolean addressTouched = false;
+    private String geoAddress = "";
+    private String address = "";
+    private boolean addressEdited = false;
 
-    // 控件
-    private TextView gpsText;
-    private EditText addressInput;
-    private CheckBox addrBox, coordBox;
-    private LinearLayout textsBox;
-    private final List<EditText> texts = new ArrayList<>();
-    private ImageView preview;
-    private LinearLayout editBar;
-    private Button shotBtn;
+    // 水印设置
+    private boolean showAddress = true, showCoords = false;
+    private final List<String> lines = new ArrayList<>();
 
-    // 当前照片
-    private File captureFile;
-    private Bitmap previewBase;
-    private long photoTime;
-    private String photoHash = "";
-    private boolean suppressWatch = false;
+    private ImageView thumb;
+    private TextView statusBar;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        loadSettings();
         setContentView(buildUi());
-        requestLocationPermission();
+        ui.postDelayed(tick, 1000);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (hasPerm(Manifest.permission.CAMERA)) {
+            startCamThread();
+            if (texture.isAvailable()) openCamera(); else texture.setSurfaceTextureListener(surfaceListener);
+        }
+        if (!askedPerms && (!hasPerm(Manifest.permission.CAMERA) || !hasPerm(Manifest.permission.ACCESS_FINE_LOCATION))) {
+            askedPerms = true;
+            requestPermissions(new String[]{Manifest.permission.CAMERA,
+                    Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_PERMS);
+        } else if (hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)) {
+            readLocation();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        closeCamera();
+        stopCamThread();
+        super.onPause();
+    }
+
+    private boolean hasPerm(String p) { return checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED; }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        if (req != REQ_PERMS) return;
+        if (hasPerm(Manifest.permission.CAMERA)) {
+            startCamThread();
+            if (texture.isAvailable()) openCamera(); else texture.setSurfaceTextureListener(surfaceListener);
+        } else {
+            toast("需要相机权限才能拍照");
+        }
+        if (hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)) readLocation();
+        else setStatus("定位未授权，可点「编辑」手动填写地址");
     }
 
     // ================= 界面 =================
     private View buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(18), dp(16), dp(24));
-        root.setBackgroundColor(Color.parseColor("#F4F5F7"));
-        scroll.addView(root);
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
 
-        TextView title = new TextView(this);
-        title.setText("胜利水印相机");
-        title.setTextSize(22);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(Color.parseColor("#2F5BFF"));
-        root.addView(title);
-        TextView sub = label("真实时间水印 · 无广告 · 无会员", 12, "#8A8F99");
-        sub.setPadding(0, dp(2), 0, dp(12));
-        root.addView(sub);
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        int fh = sw * 4 / 3;
+        frame = new FrameLayout(this);
+        FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(sw, fh);
+        flp.topMargin = dp(48);
+        root.addView(frame, flp);
 
-        preview = new ImageView(this);
-        preview.setAdjustViewBounds(true);
-        preview.setVisibility(View.GONE);
-        root.addView(preview, new LinearLayout.LayoutParams(-1, -2));
+        texture = new TextureView(this);
+        frame.addView(texture, new FrameLayout.LayoutParams(-1, -1));
+        overlay = new ImageView(this);
+        overlay.setScaleType(ImageView.ScaleType.FIT_XY);
+        frame.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        overlay.setOnClickListener(v -> openEditor());
 
-        editBar = new LinearLayout(this);
-        editBar.setOrientation(LinearLayout.HORIZONTAL);
-        editBar.setVisibility(View.GONE);
-        editBar.setPadding(0, dp(8), 0, dp(4));
-        Button discard = button("重拍", "#E6E8EE", "#333333");
-        discard.setOnClickListener(v -> { clearPhoto(); takePhoto(); });
-        Button save = button("保存到相册", "#2F5BFF", "#FFFFFF");
-        save.setOnClickListener(v -> saveCurrent());
-        editBar.addView(discard, new LinearLayout.LayoutParams(0, -2, 1));
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(0, -2, 2);
-        sp.leftMargin = dp(10);
-        editBar.addView(save, sp);
-        root.addView(editBar);
-
-        // 地点卡片
-        LinearLayout loc = card(root);
-        loc.addView(label("地点", 15, "#222222"));
-        gpsText = label("定位：获取中…", 12, "#666666");
-        gpsText.setPadding(0, dp(4), 0, dp(4));
-        loc.addView(gpsText);
-        addressInput = new EditText(this);
-        addressInput.setHint("地址（可手动修改）");
-        addressInput.setTextSize(15);
-        addressInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        addressInput.addTextChangedListener(new Watch(() -> { addressTouched = true; refresh(); }));
-        loc.addView(addressInput);
-        LinearLayout locBtns = new LinearLayout(this);
-        Button relocate = button("重新定位", "#E8EEFF", "#2F5BFF");
-        relocate.setOnClickListener(v -> readLocation());
-        Button restore = button("恢复真实地址", "#E8EEFF", "#2F5BFF");
-        restore.setOnClickListener(v -> restoreAddress());
-        locBtns.addView(relocate, new LinearLayout.LayoutParams(0, -2, 1));
-        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(0, -2, 1);
-        rp.leftMargin = dp(8);
-        locBtns.addView(restore, rp);
-        loc.addView(locBtns);
-        TextView tip = label("手动改过的地址会在水印上标「位置已手动修改」，且不生成防伪码。", 11, "#A0A4AD");
-        tip.setPadding(0, dp(6), 0, 0);
-        loc.addView(tip);
-
-        // 显示项
-        LinearLayout show = card(root);
-        show.addView(label("水印显示", 15, "#222222"));
-        addrBox = check("地点", true);
-        coordBox = check("经纬度（WGS84）", false);
-        show.addView(addrBox);
-        show.addView(coordBox);
-
-        // 加字
-        LinearLayout tx = card(root);
-        tx.addView(label("加字", 15, "#222222"));
-        textsBox = new LinearLayout(this);
-        textsBox.setOrientation(LinearLayout.VERTICAL);
-        tx.addView(textsBox);
-        Button add = button("+ 添加一行文字", "#E8EEFF", "#2F5BFF");
-        add.setOnClickListener(v -> addTextLine(""));
-        tx.addView(add);
-        addTextLine("");
-
-        shotBtn = button("拍照", "#2F5BFF", "#FFFFFF");
-        shotBtn.setTextSize(18);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(56));
-        lp.topMargin = dp(14);
-        root.addView(shotBtn, lp);
-        shotBtn.setOnClickListener(v -> takePhoto());
-
-        Button verify = button("查验防伪码", "#FFFFFF", "#2F5BFF");
-        LinearLayout.LayoutParams vp = new LinearLayout.LayoutParams(-1, -2);
-        vp.topMargin = dp(8);
-        root.addView(verify, vp);
+        // 顶部栏
+        LinearLayout top = new LinearLayout(this);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.setPadding(dp(14), 0, dp(14), 0);
+        TextView name = new TextView(this);
+        name.setText("水印相机");
+        name.setTextColor(Color.WHITE);
+        name.setTextSize(17);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        top.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+        Button verify = smallBtn("查验");
         verify.setOnClickListener(v -> showVerify());
+        top.addView(verify);
+        root.addView(top, new FrameLayout.LayoutParams(-1, dp(48)));
 
-        return scroll;
+        statusBar = new TextView(this);
+        statusBar.setTextColor(Color.parseColor("#DDDDDD"));
+        statusBar.setTextSize(12);
+        statusBar.setGravity(Gravity.CENTER);
+        statusBar.setText("定位中…");
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(-1, -2);
+        slp.topMargin = dp(48) + fh + dp(6);
+        root.addView(statusBar, slp);
+
+        // 底部操作
+        LinearLayout bottom = new LinearLayout(this);
+        bottom.setGravity(Gravity.CENTER_VERTICAL);
+        bottom.setPadding(dp(24), 0, dp(24), 0);
+        thumb = new ImageView(this);
+        thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        GradientDrawable tb = new GradientDrawable();
+        tb.setColor(Color.parseColor("#333333"));
+        tb.setCornerRadius(dp(8));
+        thumb.setBackground(tb);
+        thumb.setClipToOutline(true);
+        bottom.addView(thumb, new LinearLayout.LayoutParams(dp(52), dp(52)));
+        bottom.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+
+        View shutter = new View(this);
+        GradientDrawable sd = new GradientDrawable();
+        sd.setShape(GradientDrawable.OVAL);
+        sd.setColor(Color.WHITE);
+        sd.setStroke(dp(5), Color.parseColor("#888888"));
+        shutter.setBackground(sd);
+        shutter.setOnClickListener(v -> takePicture());
+        bottom.addView(shutter, new LinearLayout.LayoutParams(dp(76), dp(76)));
+        bottom.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+
+        LinearLayout edit = new LinearLayout(this);
+        edit.setOrientation(LinearLayout.VERTICAL);
+        edit.setGravity(Gravity.CENTER);
+        TextView aa = new TextView(this);
+        aa.setText("Aa");
+        aa.setTextColor(Color.WHITE);
+        aa.setTextSize(22);
+        aa.setTypeface(Typeface.DEFAULT_BOLD);
+        aa.setGravity(Gravity.CENTER);
+        TextView el = new TextView(this);
+        el.setText("编辑文字");
+        el.setTextColor(Color.WHITE);
+        el.setTextSize(11);
+        edit.addView(aa);
+        edit.addView(el);
+        edit.setOnClickListener(v -> openEditor());
+        bottom.addView(edit, new LinearLayout.LayoutParams(dp(60), dp(60)));
+
+        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(-1, dp(110), Gravity.BOTTOM);
+        blp.bottomMargin = dp(18);
+        root.addView(bottom, blp);
+        return root;
     }
 
-    private void addTextLine(String value) {
-        if (texts.size() >= MAX_TEXTS) { toast("最多 " + MAX_TEXTS + " 行"); return; }
-        LinearLayout row = new LinearLayout(this);
-        EditText e = new EditText(this);
-        e.setHint("例如：项目名称 / 施工内容 / 打卡人");
-        e.setTextSize(15);
-        e.setText(value);
-        e.addTextChangedListener(new Watch(this::refresh));
-        Button del = button("删除", "#F4F5F7", "#999999");
-        row.addView(e, new LinearLayout.LayoutParams(0, -2, 1));
-        row.addView(del, new LinearLayout.LayoutParams(-2, -2));
-        del.setOnClickListener(v -> { textsBox.removeView(row); texts.remove(e); refresh(); });
-        texts.add(e);
-        textsBox.addView(row);
-    }
-
-    private LinearLayout card(LinearLayout parent) {
-        LinearLayout c = new LinearLayout(this);
-        c.setOrientation(LinearLayout.VERTICAL);
-        c.setPadding(dp(14), dp(12), dp(14), dp(12));
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(Color.WHITE);
-        g.setCornerRadius(dp(12));
-        c.setBackground(g);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(10);
-        parent.addView(c, lp);
-        return c;
-    }
-
-    private TextView label(String s, int size, String color) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextSize(size);
-        t.setTextColor(Color.parseColor(color));
-        if (size >= 15) t.setTypeface(Typeface.DEFAULT_BOLD);
-        return t;
-    }
-
-    private CheckBox check(String s, boolean on) {
-        CheckBox cb = new CheckBox(this);
-        cb.setText(s);
-        cb.setChecked(on);
-        cb.setOnCheckedChangeListener((v, c) -> refresh());
-        return cb;
-    }
-
-    private Button button(String s, String bg, String fg) {
+    private Button smallBtn(String s) {
         Button b = new Button(this);
         b.setText(s);
         b.setAllCaps(false);
-        b.setTextColor(Color.parseColor(fg));
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(13);
         GradientDrawable g = new GradientDrawable();
-        g.setColor(Color.parseColor(bg));
-        g.setCornerRadius(dp(10));
+        g.setColor(Color.parseColor("#33FFFFFF"));
+        g.setCornerRadius(dp(14));
         b.setBackground(g);
         b.setStateListAnimator(null);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setPadding(dp(12), dp(4), dp(12), dp(4));
         return b;
     }
 
@@ -246,39 +257,159 @@ public class MainActivity extends Activity {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
     }
 
-    private class Watch implements TextWatcher {
-        private final Runnable r;
-        Watch(Runnable r) { this.r = r; }
-        public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
-        public void onTextChanged(CharSequence s, int a, int b, int c) { }
-        public void afterTextChanged(Editable s) { if (!suppressWatch) r.run(); }
+    private void setStatus(String s) { statusBar.setText(s); }
+
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            drawOverlay();
+            ui.postDelayed(this, 1000);
+        }
+    };
+
+    /** 取景框上的实时水印，和成片同一套绘制，比例一致。 */
+    private void drawOverlay() {
+        int w = frame.getWidth(), h = frame.getHeight();
+        if (w <= 0 || h <= 0) return;
+        Bitmap bm = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Watermark.draw(new Canvas(bm), w, h, buildData(System.currentTimeMillis(), null));
+        overlay.setImageBitmap(bm);
+    }
+
+    // ================= 编辑文字（在拍照界面里弹出） =================
+    private void openEditor() {
+        ScrollView sv = new ScrollView(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), dp(8));
+        sv.addView(box);
+
+        box.addView(caption("地点"));
+        EditText addrIn = new EditText(this);
+        addrIn.setText(address);
+        addrIn.setHint("地址");
+        addrIn.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        box.addView(addrIn);
+        Button restore = new Button(this);
+        restore.setText("恢复真实定位地址");
+        restore.setAllCaps(false);
+        restore.setOnClickListener(v -> {
+            if (geoAddress.isEmpty()) toast("还没有定位地址");
+            else addrIn.setText(geoAddress);
+        });
+        box.addView(restore);
+        TextView tip = caption("手动改过的地址会标「位置已手动修改」，不生成防伪码。");
+        tip.setTextSize(11);
+        tip.setTypeface(Typeface.DEFAULT);
+        box.addView(tip);
+
+        CheckBox addrBox = new CheckBox(this);
+        addrBox.setText("显示地点");
+        addrBox.setChecked(showAddress);
+        CheckBox coordBox = new CheckBox(this);
+        coordBox.setText("显示经纬度");
+        coordBox.setChecked(showCoords);
+        box.addView(addrBox);
+        box.addView(coordBox);
+
+        box.addView(caption("文字（每行一条，最多 " + MAX_TEXTS + " 行）"));
+        LinearLayout lineBox = new LinearLayout(this);
+        lineBox.setOrientation(LinearLayout.VERTICAL);
+        box.addView(lineBox);
+        List<EditText> edits = new ArrayList<>();
+        for (String l : lines) addLine(lineBox, edits, l);
+        if (edits.isEmpty()) addLine(lineBox, edits, "");
+        Button add = new Button(this);
+        add.setText("+ 添加一行");
+        add.setAllCaps(false);
+        add.setOnClickListener(v -> {
+            if (edits.size() >= MAX_TEXTS) toast("最多 " + MAX_TEXTS + " 行");
+            else addLine(lineBox, edits, "");
+        });
+        box.addView(add);
+
+        new AlertDialog.Builder(this)
+                .setTitle("编辑水印文字")
+                .setView(sv)
+                .setPositiveButton("完成", (d, w) -> {
+                    String a = addrIn.getText().toString().trim().replace("\n", " ");
+                    addressEdited = !a.equals(geoAddress);
+                    address = a;
+                    showAddress = addrBox.isChecked();
+                    showCoords = coordBox.isChecked();
+                    lines.clear();
+                    for (EditText e : edits) {
+                        String s = e.getText().toString().trim();
+                        if (!s.isEmpty()) lines.add(s);
+                    }
+                    saveSettings();
+                    drawOverlay();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void addLine(LinearLayout parent, List<EditText> edits, String v) {
+        LinearLayout row = new LinearLayout(this);
+        EditText e = new EditText(this);
+        e.setText(v);
+        e.setHint("例如：项目名称 / 施工内容 / 打卡人");
+        Button del = new Button(this);
+        del.setText("删");
+        del.setOnClickListener(x -> { parent.removeView(row); edits.remove(e); });
+        row.addView(e, new LinearLayout.LayoutParams(0, -2, 1));
+        row.addView(del, new LinearLayout.LayoutParams(dp(52), -2));
+        parent.addView(row);
+        edits.add(e);
+    }
+
+    private TextView caption(String s) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextSize(14);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setPadding(0, dp(10), 0, dp(2));
+        return t;
+    }
+
+    private void loadSettings() {
+        showAddress = prefs.getBoolean("showAddress", true);
+        showCoords = prefs.getBoolean("showCoords", false);
+        String l = prefs.getString("lines", "");
+        lines.clear();
+        for (String s : l.split("\n")) if (!s.trim().isEmpty()) lines.add(s);
+    }
+
+    private void saveSettings() {
+        prefs.edit().putBoolean("showAddress", showAddress).putBoolean("showCoords", showCoords)
+                .putString("lines", String.join("\n", lines)).apply();
+    }
+
+    // ================= 水印数据 =================
+    private WatermarkData buildData(long time, String photoHash) {
+        WatermarkData d = new WatermarkData();
+        d.timeMillis = time;
+        d.address = address;
+        d.lat = lat;
+        d.lng = lng;
+        d.showAddress = showAddress;
+        d.showCoords = showCoords;
+        d.lines.addAll(lines);
+        boolean hasFix = !Double.isNaN(lat) && Math.abs(time - fixTime) < 15 * 60 * 1000;
+        if (!hasFix) {
+            d.statusNote = address.isEmpty() ? "未获取定位" : "位置为手动填写";
+        } else if (addressEdited) {
+            d.statusNote = "位置已手动修改";
+        } else {
+            d.verified = true;
+            d.code = photoHash == null ? "············" : AntiFake.code(this, photoHash, time, lat, lng, address);
+        }
+        return d;
     }
 
     // ================= 定位 =================
-    private void requestLocationPermission() {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_LOC);
-        } else {
-            readLocation();
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
-        if (req == REQ_LOC) {
-            if (res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) readLocation();
-            else gpsText.setText("定位：未授权，可手动填写地址（不生成防伪码）");
-        }
-    }
-
     @SuppressWarnings("MissingPermission")
     private void readLocation() {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestLocationPermission();
-            return;
-        }
-        gpsText.setText("定位：获取中…");
+        if (!hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)) return;
         LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         Location best = null;
         try {
@@ -287,57 +418,37 @@ public class MainActivity extends Activity {
                 if (l != null && (best == null || l.getTime() > best.getTime())) best = l;
             }
         } catch (SecurityException ignored) { }
-        if (best != null && System.currentTimeMillis() - best.getTime() < 2 * 60 * 1000) {
-            applyLocation(best);
-            return;
-        }
         if (best != null) applyLocation(best);
         try {
             String prov = lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
                     ? LocationManager.GPS_PROVIDER : LocationManager.NETWORK_PROVIDER;
             lm.requestSingleUpdate(prov, this::applyLocation, Looper.getMainLooper());
-            ui.postDelayed(() -> {
-                if (Double.isNaN(lat)) gpsText.setText("定位：暂无信号，可在室外重试");
-            }, 10000);
-        } catch (Exception e) {
-            if (best == null) gpsText.setText("定位：不可用");
-        }
+        } catch (Exception ignored) { }
     }
 
     private void applyLocation(Location l) {
-        if (l.isFromMockProvider()) {
-            gpsText.setText("定位：检测到模拟位置，已忽略");
-            return;
-        }
+        if (l.isFromMockProvider()) { setStatus("检测到模拟位置，已忽略"); return; }
         lat = l.getLatitude();
         lng = l.getLongitude();
-        fixTime = l.getTime();
-        updateGpsText();
-        reverseGeocode();
-        refresh();
-    }
-
-    private void updateGpsText() {
-        String s = "定位：" + Watermark.coords(lat, lng);
-        s += "\n" + (geoAddress.isEmpty() ? "地址反查中…（查不到时可手动填写）" : "真实地址：" + geoAddress);
-        gpsText.setText(s);
-    }
-
-    private void reverseGeocode() {
+        fixTime = System.currentTimeMillis();
+        setStatus("已定位 " + Watermark.coords(lat, lng));
         final double qa = lat, qb = lng;
         new Thread(() -> {
-            String addr = "";
+            String a = "";
             try {
                 android.location.Geocoder g = new android.location.Geocoder(this, Locale.CHINA);
                 List<android.location.Address> list = g.getFromLocation(qa, qb, 1);
-                if (list != null && !list.isEmpty()) addr = format(list.get(0));
+                if (list != null && !list.isEmpty()) a = format(list.get(0));
             } catch (Exception ignored) { }
-            final String a = addr;
+            final String addr = a;
             ui.post(() -> {
-                geoAddress = a;
-                if (!addressTouched || addressInput.getText().toString().trim().isEmpty()) setAddressSilently(a);
-                updateGpsText();
-                refresh();
+                if (!addr.isEmpty()) {
+                    geoAddress = addr;
+                    if (!addressEdited) address = addr;
+                } else if (geoAddress.isEmpty()) {
+                    setStatus("已定位，地址反查失败，可点「编辑文字」手动填写");
+                }
+                drawOverlay();
             });
         }).start();
     }
@@ -352,192 +463,175 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    private void setAddressSilently(String a) {
-        suppressWatch = true;
-        addressInput.setText(a);
-        suppressWatch = false;
-        addressTouched = false;
+    // ================= Camera2 =================
+    private final TextureView.SurfaceTextureListener surfaceListener = new TextureView.SurfaceTextureListener() {
+        public void onSurfaceTextureAvailable(SurfaceTexture s, int w, int h) { openCamera(); }
+        public void onSurfaceTextureSizeChanged(SurfaceTexture s, int w, int h) { }
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture s) { return true; }
+        public void onSurfaceTextureUpdated(SurfaceTexture s) { }
+    };
+
+    private void startCamThread() {
+        if (camThread != null) return;
+        camThread = new HandlerThread("cam");
+        camThread.start();
+        camHandler = new Handler(camThread.getLooper());
     }
 
-    private void restoreAddress() {
-        if (geoAddress.isEmpty()) { toast("还没有真实地址，请先重新定位"); return; }
-        setAddressSilently(geoAddress);
-        refresh();
+    private void stopCamThread() {
+        if (camThread == null) return;
+        camThread.quitSafely();
+        camThread = null;
+        camHandler = null;
     }
 
-    // ================= 拍照 =================
-    private void takePhoto() {
+    @SuppressWarnings("MissingPermission")
+    private void openCamera() {
+        if (camera != null || !hasPerm(Manifest.permission.CAMERA)) return;
+        CameraManager cm = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
         try {
-            captureFile = new File(getCacheDir(), "cap_" + System.currentTimeMillis() + ".jpg");
-            Uri uri = PhotoProvider.uriFor(captureFile.getName());
-            Intent i = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
-            i.putExtra(MediaStore.EXTRA_OUTPUT, uri);
-            i.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivityForResult(i, REQ_CAMERA);
-        } catch (Exception e) {
-            toast("无法启动相机：" + e.getMessage());
-        }
-    }
-
-    @Override
-    protected void onActivityResult(int req, int res, Intent data) {
-        super.onActivityResult(req, res, data);
-        if (req != REQ_CAMERA) return;
-        if (res == Activity.RESULT_OK && captureFile != null && captureFile.length() > 0) {
-            final File f = captureFile;
-            final long resultTime = System.currentTimeMillis();
-            new Thread(() -> loadCaptured(f, resultTime)).start();
-        } else if (captureFile != null) {
-            captureFile.delete();
-        }
-    }
-
-    private void loadCaptured(File f, long fallbackTime) {
-        try {
-            byte[] bytes = readAll(f);
-            String hash = AntiFake.sha256Hex(bytes);
-            long t = exifTime(f.getAbsolutePath(), fallbackTime);
-            Bitmap small = decode(f.getAbsolutePath(), 1440);
-            ui.post(() -> {
-                photoHash = hash;
-                photoTime = t;
-                previewBase = small;
-                preview.setVisibility(View.VISIBLE);
-                editBar.setVisibility(View.VISIBLE);
-                shotBtn.setText("再拍一张");
-                refresh();
-            });
-        } catch (Exception e) {
-            ui.post(() -> toast("读取照片失败"));
-        }
-    }
-
-    private void clearPhoto() {
-        if (captureFile != null) captureFile.delete();
-        captureFile = null;
-        previewBase = null;
-        preview.setImageDrawable(null);
-        preview.setVisibility(View.GONE);
-        editBar.setVisibility(View.GONE);
-        shotBtn.setText("拍照");
-    }
-
-    /** 时间取相机写入的拍摄时间，与系统时间相差过大时用系统时间。 */
-    private long exifTime(String path, long fallback) {
-        try {
-            ExifInterface ex = new ExifInterface(path);
-            String s = ex.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL);
-            if (s != null) {
-                long t = new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(s).getTime();
-                if (Math.abs(t - fallback) < 10 * 60 * 1000) return t;
+            String id = null;
+            for (String c : cm.getCameraIdList()) {
+                Integer f = cm.getCameraCharacteristics(c).get(CameraCharacteristics.LENS_FACING);
+                if (f != null && f == CameraCharacteristics.LENS_FACING_BACK) { id = c; break; }
             }
-        } catch (Exception ignored) { }
-        return fallback;
-    }
-
-    // ================= 水印 =================
-    private WatermarkData currentData() {
-        WatermarkData d = new WatermarkData();
-        d.timeMillis = photoTime == 0 ? System.currentTimeMillis() : photoTime;
-        String addr = addressInput.getText().toString().trim().replace("\n", " ");
-        d.address = addr;
-        d.lat = lat;
-        d.lng = lng;
-        d.showAddress = addrBox.isChecked();
-        d.showCoords = coordBox.isChecked();
-        for (EditText e : texts) d.lines.add(e.getText().toString());
-
-        boolean hasFix = !Double.isNaN(lat) && Math.abs(d.timeMillis - fixTime) < 15 * 60 * 1000;
-        boolean addrReal = addr.equals(geoAddress) || (geoAddress.isEmpty() && addr.isEmpty());
-        if (!hasFix) {
-            d.verified = false;
-            d.statusNote = addr.isEmpty() ? "未获取定位" : "位置为手动填写";
-        } else if (!addrReal) {
-            d.verified = false;
-            d.statusNote = "位置已手动修改";
-        } else {
-            d.verified = true;
-            d.code = AntiFake.code(this, photoHash, d.timeMillis, lat, lng, addr);
+            if (id == null) id = cm.getCameraIdList()[0];
+            CameraCharacteristics ch = cm.getCameraCharacteristics(id);
+            Integer so = ch.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            sensorOrientation = so == null ? 90 : so;
+            StreamConfigurationMap map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            jpegSize = pick43(map.getOutputSizes(ImageFormat.JPEG), 4000);
+            previewSize = pick43(map.getOutputSizes(SurfaceTexture.class), 1920);
+            reader = ImageReader.newInstance(jpegSize.getWidth(), jpegSize.getHeight(), ImageFormat.JPEG, 2);
+            reader.setOnImageAvailableListener(this::onJpeg, camHandler);
+            cm.openCamera(id, new CameraDevice.StateCallback() {
+                public void onOpened(CameraDevice c) { camera = c; startPreview(); }
+                public void onDisconnected(CameraDevice c) { c.close(); camera = null; }
+                public void onError(CameraDevice c, int e) { c.close(); camera = null; ui.post(() -> toast("相机打开失败")); }
+            }, camHandler);
+        } catch (Exception e) {
+            toast("相机不可用：" + e.getMessage());
         }
-        return d;
     }
 
-    private void refresh() {
-        if (previewBase == null || preview == null) return;
-        Bitmap out = previewBase.copy(Bitmap.Config.ARGB_8888, true);
-        Watermark.draw(new Canvas(out), out.getWidth(), out.getHeight(), currentData());
-        preview.setImageBitmap(out);
+    /** 选最接近 4:3、长边不超过 maxLong 的最大尺寸。 */
+    private static Size pick43(Size[] sizes, int maxLong) {
+        List<Size> ok = new ArrayList<>();
+        for (Size s : sizes) {
+            int lo = Math.max(s.getWidth(), s.getHeight()), sh = Math.min(s.getWidth(), s.getHeight());
+            if (lo <= maxLong && Math.abs(lo * 3 - sh * 4) <= lo / 50) ok.add(s);
+        }
+        List<Size> pool = ok.isEmpty() ? Arrays.asList(sizes) : ok;
+        return Collections.max(pool, (a, b) -> Long.compare((long) a.getWidth() * a.getHeight(), (long) b.getWidth() * b.getHeight()));
     }
 
-    private void saveCurrent() {
-        if (captureFile == null || !captureFile.exists()) { toast("请先拍照"); return; }
-        final WatermarkData d = currentData();
-        final File f = captureFile;
-        toast("正在保存…");
-        new Thread(() -> {
-            try {
-                Bitmap full = decode(f.getAbsolutePath(), 4096);
-                if (!full.isMutable()) full = full.copy(Bitmap.Config.ARGB_8888, true);
-                Watermark.draw(new Canvas(full), full.getWidth(), full.getHeight(), d);
-                Uri u = saveToGallery(full, d.timeMillis);
-                if (u != null && d.verified) {
-                    AntiFake.record(this, d.code,
-                            new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(d.timeMillis)
-                                    + "\n" + d.address + "\n" + Watermark.coords(d.lat, d.lng));
+    private void startPreview() {
+        try {
+            SurfaceTexture st = texture.getSurfaceTexture();
+            st.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
+            Surface s = new Surface(st);
+            final CaptureRequest.Builder rb = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            rb.addTarget(s);
+            rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            camera.createCaptureSession(Arrays.asList(s, reader.getSurface()), new CameraCaptureSession.StateCallback() {
+                public void onConfigured(CameraCaptureSession cs) {
+                    session = cs;
+                    try { cs.setRepeatingRequest(rb.build(), null, camHandler); } catch (Exception ignored) { }
                 }
-                full.recycle();
-                ui.post(() -> {
-                    if (u != null) { toast("已保存到相册"); clearPhoto(); }
-                    else toast("保存失败");
-                });
-            } catch (OutOfMemoryError | Exception e) {
-                ui.post(() -> toast("保存失败：" + e.getMessage()));
-            }
-        }).start();
+                public void onConfigureFailed(CameraCaptureSession cs) { ui.post(() -> toast("预览启动失败")); }
+            }, camHandler);
+        } catch (CameraAccessException e) {
+            toast("预览启动失败");
+        }
     }
 
-    private Bitmap decode(String path, int maxSide) {
-        BitmapFactory.Options b = new BitmapFactory.Options();
-        b.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(path, b);
-        int sample = 1;
-        while (Math.max(b.outWidth, b.outHeight) / sample > maxSide) sample *= 2;
-        BitmapFactory.Options o = new BitmapFactory.Options();
-        o.inSampleSize = sample;
-        o.inMutable = true;
-        Bitmap bmp = BitmapFactory.decodeFile(path, o);
-        int deg = 0;
+    private void closeCamera() {
+        if (session != null) { session.close(); session = null; }
+        if (camera != null) { camera.close(); camera = null; }
+        if (reader != null) { reader.close(); reader = null; }
+    }
+
+    private void takePicture() {
+        if (camera == null || session == null || busy) return;
+        busy = true;
         try {
-            int or = new ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1);
-            if (or == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
-            else if (or == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
-            else if (or == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
-        } catch (Exception ignored) { }
-        if (deg != 0 && bmp != null) {
-            Matrix m = new Matrix();
-            m.postRotate(deg);
-            Bitmap r = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
-            if (r != bmp) bmp.recycle();
-            bmp = r;
+            CaptureRequest.Builder rb = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+            rb.addTarget(reader.getSurface());
+            rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            rb.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation);
+            rb.set(CaptureRequest.JPEG_QUALITY, (byte) 95);
+            session.capture(rb.build(), null, camHandler);
+            frame.animate().alpha(0.3f).setDuration(80).withEndAction(() -> frame.animate().alpha(1f).setDuration(120));
+        } catch (Exception e) {
+            busy = false;
+            toast("拍照失败");
         }
-        return bmp;
     }
 
-    private static byte[] readAll(File f) throws Exception {
-        byte[] buf = new byte[(int) f.length()];
-        try (FileInputStream in = new FileInputStream(f)) {
-            int off = 0, n;
-            while (off < buf.length && (n = in.read(buf, off, buf.length - off)) > 0) off += n;
+    private void onJpeg(ImageReader r) {
+        Image img = r.acquireLatestImage();
+        if (img == null) { busy = false; return; }
+        ByteBuffer buf = img.getPlanes()[0].getBuffer();
+        byte[] bytes = new byte[buf.remaining()];
+        buf.get(bytes);
+        img.close();
+        final long t = System.currentTimeMillis();
+        final WatermarkData[] holder = new WatermarkData[1];
+        // 水印数据在主线程上取，避免和编辑同时改动
+        ui.post(() -> {
+            holder[0] = buildData(t, AntiFake.sha256Hex(bytes));
+            new Thread(() -> process(bytes, holder[0])).start();
+        });
+    }
+
+    private void process(byte[] jpeg, WatermarkData d) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inMutable = true;
+            Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, o);
+            int deg = 0;
+            try {
+                int or = new ExifInterface(new ByteArrayInputStream(jpeg))
+                        .getAttributeInt(ExifInterface.TAG_ORIENTATION, 1);
+                if (or == ExifInterface.ORIENTATION_ROTATE_90) deg = 90;
+                else if (or == ExifInterface.ORIENTATION_ROTATE_180) deg = 180;
+                else if (or == ExifInterface.ORIENTATION_ROTATE_270) deg = 270;
+            } catch (Exception ignored) { }
+            // 竖屏拍摄但设备没写 EXIF 也没旋转像素时，按传感器方向补转
+            if (deg == 0 && bmp.getWidth() > bmp.getHeight()) deg = sensorOrientation;
+            if (deg != 0) {
+                Matrix m = new Matrix();
+                m.postRotate(deg);
+                Bitmap rot = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+                if (rot != bmp) bmp.recycle();
+                bmp = rot;
+            }
+            if (!bmp.isMutable()) bmp = bmp.copy(Bitmap.Config.ARGB_8888, true);
+            Watermark.draw(new Canvas(bmp), bmp.getWidth(), bmp.getHeight(), d);
+            Uri u = saveToGallery(bmp, d.timeMillis);
+            if (u != null && d.verified) {
+                AntiFake.record(this, d.code,
+                        new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(d.timeMillis)
+                                + "\n" + d.address + "\n" + Watermark.coords(d.lat, d.lng));
+            }
+            Bitmap small = Bitmap.createScaledBitmap(bmp, 240, 240 * bmp.getHeight() / bmp.getWidth(), true);
+            bmp.recycle();
+            ui.post(() -> {
+                busy = false;
+                if (u != null) { thumb.setImageBitmap(small); toast("已保存到相册"); }
+                else toast("保存失败");
+            });
+        } catch (Throwable e) {
+            ui.post(() -> { busy = false; toast("保存失败：" + e.getMessage()); });
         }
-        return buf;
     }
 
     private Uri saveToGallery(Bitmap bmp, long t) {
         ContentValues cv = new ContentValues();
-        cv.put(MediaStore.Images.Media.DISPLAY_NAME, "胜利水印_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(t) + ".jpg");
+        cv.put(MediaStore.Images.Media.DISPLAY_NAME, "水印相机_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(t) + ".jpg");
         cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
         cv.put(MediaStore.Images.Media.DATE_TAKEN, t);
-        cv.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/胜利水印相机");
+        cv.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/水印相机");
         Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
         if (uri == null) return null;
         try (OutputStream os = getContentResolver().openOutputStream(uri)) {

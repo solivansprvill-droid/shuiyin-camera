@@ -64,7 +64,7 @@ public final class Watermark {
         for (String s : d.lines) {
             if (s != null && !s.trim().isEmpty()) blocks.add(new Object[]{layout(s.trim(), addrP, textW, 2, u), ""});
         }
-        String status = d.verified ? "胜利水印相机·时间地点未修改" : d.statusNote;
+        String status = d.verified ? "水印相机·时间地点未修改" : d.statusNote;
         StaticLayout statusL = (status == null || status.isEmpty()) ? null : layout(status, statusP, textW, 1, u);
 
         float boxH = 100 * u, boxW = 84 * u, colonW = 38 * u;
@@ -156,7 +156,7 @@ public final class Watermark {
         c.drawText(s2, right - l2.measureText(s2), y, l2);
         y -= 44 * u + 8 * u;
         TextPaint l1 = tp(40 * u, Color.WHITE, b);
-        String s1 = "· 胜利 ·";
+        String s1 = "· 真实 ·";
         float w2 = l2.measureText(s2);
         c.drawText(s1, right - w2 / 2f - l1.measureText(s1) / 2f, y, l1);
     }
