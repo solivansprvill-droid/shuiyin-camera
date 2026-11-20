@@ -96,6 +96,7 @@ public class MainActivity extends Activity {
     private final List<String> lines = new ArrayList<>();
 
     private ImageView thumb;
+    private FrameLayout rootView;
     private TextView statusBar;
 
     @Override
@@ -148,6 +149,7 @@ public class MainActivity extends Activity {
     // ================= 界面 =================
     private View buildUi() {
         FrameLayout root = new FrameLayout(this);
+        rootView = root;
         root.setBackgroundColor(Color.BLACK);
 
         int sw = getResources().getDisplayMetrics().widthPixels;
@@ -643,6 +645,18 @@ public class MainActivity extends Activity {
             }
             if (!bmp.isMutable()) bmp = bmp.copy(Bitmap.Config.ARGB_8888, true);
             Watermark.draw(new Canvas(bmp), bmp.getWidth(), bmp.getHeight(), d);
+            final Bitmap done = bmp;
+            ui.post(() -> new PhotoEditor(this, rootView, done, (finalBmp) -> saveEdited(finalBmp, d),
+                    () -> { done.recycle(); busy = false; }).show());
+        } catch (Throwable e) {
+            ui.post(() -> { busy = false; toast("保存失败：" + e.getMessage()); });
+        }
+    }
+
+    /** 编辑完成后保存。 */
+    private void saveEdited(Bitmap bmp, WatermarkData d) {
+        toast("正在保存…");
+        new Thread(() -> {
             Uri u = saveToGallery(bmp, d.timeMillis);
             if (u != null && d.verified) {
                 AntiFake.record(this, d.code,
@@ -656,9 +670,13 @@ public class MainActivity extends Activity {
                 if (u != null) { thumb.setImageBitmap(small); toast("已保存到相册"); }
                 else toast("保存失败");
             });
-        } catch (Throwable e) {
-            ui.post(() -> { busy = false; toast("保存失败：" + e.getMessage()); });
-        }
+        }).start();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (PhotoEditor.handleBack(rootView)) return;
+        super.onBackPressed();
     }
 
     private Uri saveToGallery(Bitmap bmp, long t) {
