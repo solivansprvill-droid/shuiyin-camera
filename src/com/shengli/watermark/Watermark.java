@@ -156,7 +156,7 @@ public final class Watermark {
         c.drawText(s2, right - l2.measureText(s2), y, l2);
         y -= 44 * u + 8 * u;
         TextPaint l1 = tp(40 * u, Color.WHITE, b);
-        String s1 = "· 真实 ·";
+        String s1 = "·   ·";
         float w2 = l2.measureText(s2);
         c.drawText(s1, right - w2 / 2f - l1.measureText(s1) / 2f, y, l1);
     }
