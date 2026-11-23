@@ -225,8 +225,9 @@ public class PhotoEditor {
     }
 
     private void applyShadow(TextView tv, int color) {
-        boolean dark = Color.luminance(color) < 0.3f;
-        tv.setShadowLayer(dp(3), 0, dp(1), dark ? Color.argb(180, 255, 255, 255) : Color.argb(200, 0, 0, 0));
+        // 马克式：彩色字不加阴影，白字只加一圈很窄的淡阴影，避免字边发虚
+        if (Color.luminance(color) > 0.8f) tv.setShadowLayer(1.2f, 0, 1f, Color.argb(110, 0, 0, 0));
+        else tv.setShadowLayer(0, 0, 0, 0);
     }
 
     /** 按住拖动；几乎没动就当作点击，打开修改。 */
@@ -273,11 +274,13 @@ public class PhotoEditor {
         for (TextView tv : stickers) {
             Layout l = tv.getLayout();
             if (l == null) continue;
-            Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG | Paint.LINEAR_TEXT_FLAG);
+            p.setHinting(Paint.HINTING_OFF);
             p.setTypeface(tv.getTypeface());
             p.setTextSize(tv.getTextSize() * scale);
             p.setColor(tv.getCurrentTextColor());
-            p.setShadowLayer(tv.getShadowRadius() * scale, tv.getShadowDx() * scale, tv.getShadowDy() * scale, tv.getShadowColor());
+            if (tv.getShadowRadius() > 0)
+                p.setShadowLayer(Math.max(1f, tv.getShadowRadius() * scale * 0.6f), 0, Math.max(1f, tv.getShadowDy() * scale * 0.6f), tv.getShadowColor());
             float left = (tv.getX() + tv.getPaddingLeft()) * scale;
             float top = (tv.getY() + tv.getPaddingTop()) * scale;
             CharSequence text = tv.getText();

@@ -87,7 +87,7 @@ public class MainActivity extends Activity {
     private int captureRot = 0;
     private OrientationEventListener orient;
     /** 成片长边像素，和马克水印相机一致：竖拍 1536×2048，横拍 2048×1536。 */
-    private static final int OUT_LONG = 2048;
+    private static final int OUT_LONG = 2304;
     private boolean busy = false;
     private boolean askedPerms = false;
 
@@ -678,7 +678,7 @@ public class MainActivity extends Activity {
                 if (rot != bmp) bmp.recycle();
                 bmp = rot;
             }
-            // 统一成马克的成片尺寸：长边 2048，4:3
+            // 统一成马克的成片尺寸：长边 2304，4:3（2304×1728）
             int lo = Math.max(bmp.getWidth(), bmp.getHeight());
             if (lo > OUT_LONG) {
                 int nw = Math.round(bmp.getWidth() * (float) OUT_LONG / lo);
@@ -742,7 +742,7 @@ public class MainActivity extends Activity {
         Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
         if (uri == null) return null;
         try (OutputStream os = getContentResolver().openOutputStream(uri)) {
-            bmp.compress(Bitmap.CompressFormat.JPEG, 92, os);
+            bmp.compress(Bitmap.CompressFormat.JPEG, 99, os);
         } catch (Exception e) {
             getContentResolver().delete(uri, null, null);
             return null;

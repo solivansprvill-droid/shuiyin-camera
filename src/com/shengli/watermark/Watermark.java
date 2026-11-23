@@ -214,11 +214,13 @@ public final class Watermark {
     }
 
     private static TextPaint tp(float size, int color, Typeface tf) {
-        TextPaint p = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+        TextPaint p = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG | Paint.LINEAR_TEXT_FLAG);
         p.setTextSize(size);
         p.setColor(color);
         p.setTypeface(tf);
-        p.setShadowLayer(Math.max(1f, size / 12f), 0, size / 28f, Color.argb(170, 0, 0, 0));
+        p.setHinting(Paint.HINTING_OFF);
+        // 马克式：字边锐利，只留很窄的淡阴影，不再用大半径模糊阴影
+        p.setShadowLayer(Math.max(1f, size / 40f), 0, Math.max(1f, size / 50f), Color.argb(110, 0, 0, 0));
         return p;
     }
 }
